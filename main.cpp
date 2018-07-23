@@ -12,6 +12,11 @@
 #include <arpa/inet.h>  //for htonl() and htons()
 #include <unistd.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/if.h>
 #include <sys/epoll.h>
 #include <signal.h>     //for signal()
 #include <pthread.h>
@@ -22,6 +27,7 @@
 #include <sstream>
 #include <iomanip> //for std::setw()/setfill()
 #include <stdlib.h>
+#include <stdio.h>
 
 #define WORKER_THREAD_NUM   2
 #define min(a, b) ((a <= b) ? (a) : (b)) 
@@ -41,6 +47,8 @@ pthread_cond_t g_cond /*= PTHREAD_COND_INITIALIZER*/;
 pthread_mutex_t g_mutex /*= PTHREAD_MUTEX_INITIALIZER*/;
 
 pthread_mutex_t g_clientmutex;
+
+std::list<int> g_listClients;
 
 void prog_exit(int signo)
 {
@@ -137,7 +145,7 @@ std::string get_local_ip_by_name(const char *card_name)
 	ioctl(inet_sock, SIOCGIFADDR, &ifr);
 
 	strcpy(ip, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
-
+	std::cout << "local_ip: " << ip << std::endl;
 	return std::string(ip);
 
 }
@@ -150,7 +158,8 @@ bool create_server_listener(const char* ip, short port)
 
 	int on = 1;
 	setsockopt(g_listenfd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));//重用地址与端口
-	setsockopt(g_listenfd, SOL_SOCKET, SO_REUSEPORT, (char *)&on, sizeof(on));
+	//Linux内核(>= 3.9)支持SO_REUSEPORT特性
+	//setsockopt(g_listenfd, SOL_SOCKET, SO_REUSEPORT, (char *)&on, sizeof(on));
 
 	struct sockaddr_in servaddr;
 	memset(&servaddr, 0, sizeof(servaddr));
@@ -187,6 +196,7 @@ void release_client(int clientfd)
 void* accept_thread_func(void* arg)
 {
 	std::cout << "accept thread is running." << std::endl;
+	struct sockaddr_in clientaddr;
 	while (!g_bStop)
 	{
 		pthread_mutex_lock(&g_acceptmutex);
@@ -195,17 +205,21 @@ void* accept_thread_func(void* arg)
 			if (g_bStop == true)break;
 			pthread_cond_wait(&g_acceptcond, &g_acceptmutex);
 		}
-
-		struct sockaddr_in clientaddr;
-		socklen_t addrlen;
+		
+		memset(&clientaddr, 0x00, sizeof(sockaddr_in));
+		socklen_t addrlen = sizeof(sockaddr_in);
 		int newfd = accept(g_listenfd, (struct sockaddr *)&clientaddr, &addrlen);
 		pthread_mutex_unlock(&g_acceptmutex);
+		std::cout << std::endl;
+		g_accept_run_flag = false;//clear flag
 		if (newfd == -1)
 		{
 			std::cout << "Accept fail! " << std::endl;
 			continue;
 		}
 		std::cout << "new client connected: " << inet_ntoa(clientaddr.sin_addr) << ":" << ntohs(clientaddr.sin_port) << std::endl;
+
+		//printf("new client connected: %s:%d \n", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
 
 		//将新socket设置为non-blocking
 		int oldflag = fcntl(newfd, F_GETFL, 0);
@@ -218,7 +232,7 @@ void* accept_thread_func(void* arg)
 
 		struct epoll_event e;
 		memset(&e, 0, sizeof(e));
-		e.events = EPOLLIN | EPOLLRDHUP | EPOLLET;//时间：可读、挂断、边沿触发
+		e.events = EPOLLIN | EPOLLRDHUP | EPOLLET;//事件：可读、挂断、边沿触发
 		e.data.fd = newfd;
 		if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, newfd, &e) == -1)//为新加入的描述符注册
 		{
@@ -249,7 +263,7 @@ void* worker_thread_func(void* arg)
 		std::cout << std::endl;
 
 
-		std::string strclientmsg;
+		std::string strclientmsg="";
 		char buff[256];
 		bool bError = false;
 		while (true)
@@ -285,7 +299,7 @@ void* worker_thread_func(void* arg)
 		if (bError)
 			continue;
 
-		std::cout << "client msg: " << strclientmsg;
+		std::cout << "client msg: " << strclientmsg.size() << ", " << strclientmsg << std::endl;
 
 		////将消息加上时间标签后发回
 		//time_t now = time(NULL);
@@ -342,7 +356,7 @@ int main(int argc, char* argv[])
 			bdaemon = true;
 			break;
 		case 'p':
-			port = atol(optarg);
+			port = atol(optarg);//获取外部设置的端口号
 			break;
 		}
 	}
@@ -365,6 +379,7 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
+	g_listClients.clear();
 	//设置信号处理
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);

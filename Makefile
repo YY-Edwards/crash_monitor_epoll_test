@@ -14,7 +14,7 @@ LIB +=  -L/usr/local/lib/   -L/usr/lib/  -L/usr/src/app/crash_monitor/lib/
 
 all: $(TARGET)
 
-device_client: main.o 
+crash_monitor_app: main.o 
 
 	$(CXX) -o $@ $^ $(INC) $(LIB) $(C_FLAGS)
 
