@@ -22,15 +22,37 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <list>
+#include <map>
 #include <errno.h>
 #include <time.h>
 #include <sstream>
 #include <iomanip> //for std::setw()/setfill()
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <sys/time.h>
 
 #define WORKER_THREAD_NUM   2
 #define min(a, b) ((a <= b) ? (a) : (b)) 
+
+
+#pragma pack(push, 1)
+
+enum	UDPSENDSTATE
+{
+	CONNECTED,//已连接
+	WAITHEARTBEAT,//等待心跳，单向的
+	DISCONNECTED//已断开
+};
+
+typedef struct{
+
+	timeval		timestamp;//指令时间戳
+	int			obj_process_pid;//目标进程的pid
+	bool        connect_state;//目标连接状态
+
+}tcprecvpacket_t;
+#pragma pack(pop)
 
 int g_epollfd = 0;//epoll句柄
 bool g_bStop = false;//应用退出标志
@@ -39,6 +61,7 @@ int g_listenfd = 0;//监听描述符
 
 
 pthread_t g_acceptthreadid = 0;
+pthread_t g_timerthreadid = 0;
 pthread_t g_threadid[WORKER_THREAD_NUM] = { 0 };
 pthread_cond_t g_acceptcond;
 pthread_mutex_t g_acceptmutex;
@@ -47,8 +70,70 @@ pthread_cond_t g_cond /*= PTHREAD_COND_INITIALIZER*/;
 pthread_mutex_t g_mutex /*= PTHREAD_MUTEX_INITIALIZER*/;
 
 pthread_mutex_t g_clientmutex;
+pthread_mutex_t g_mapmutex;
 
 std::list<int> g_listClients;
+std::map<int, tcprecvpacket_t> g_client_map;//客户端map
+
+
+
+
+typedef void(*sighandler_t)(int);
+
+int pox_system(const char *cmd_line)
+{
+	//调整的原因：调用system函数时，其中会调用fork()函数，并用子进程去执行命令，父进程等待回收子进程。
+	//而初始化的时候，将SIGCHLD信号注册为回调方式处理退出的子线程，此时可能出现进入回调回收了子线程，
+	//然后再回到system里的父线程，可能因此不能回收子线程，而出现错误。而命令在子线程里有可能是执行成功的。
+	int ret = 0;
+	sighandler_t old_handler;
+	old_handler = signal(SIGCHLD, SIG_DFL);//返回上一次的行为
+	ret = system(cmd_line);
+	//（1） - 1 != status
+	//（2）WIFEXITED(status)为真
+	//（3）0 == WEXITSTATUS(status)
+	if (ret == -1)
+	{
+		//log_warning("system error:%d\n", errno);
+	}
+	else
+	{
+		//log_debug("exit ret value:0x%x\n", ret);
+		if (WIFEXITED(ret))
+		{
+			if (0 == WEXITSTATUS(ret))
+			{
+				//log_debug("run shell script successfully.\n");
+			}
+			else
+			{
+				//log_warning("run shell script fail, script exit code: %d\n", WEXITSTATUS(ret));
+			}
+		}
+		else
+		{
+			//log_warning("exit status = [%d]\n", WEXITSTATUS(ret));
+		}
+	}
+
+	signal(SIGCHLD, old_handler);//恢复之前的行为
+
+}
+
+void set_timer(int seconds, int useconds)
+{
+
+	struct timeval temp;
+
+	temp.tv_sec = seconds;
+
+	temp.tv_usec = useconds;
+
+	select(0, NULL, NULL, NULL, &temp);
+
+	return;
+
+}
 
 void prog_exit(int signo)
 {
@@ -59,6 +144,8 @@ void prog_exit(int signo)
 	std::cout << "program recv signal " << signo << " to exit." << std::endl;
 
 	g_bStop = true;
+
+	pthread_join(g_timerthreadid, NULL);//等待回收线程
 
 	g_accept_run_flag = true;
 	pthread_cond_signal(&g_acceptcond);//通知accept线程退出
@@ -88,6 +175,7 @@ void prog_exit(int signo)
 	pthread_mutex_destroy(&g_mutex);
 
 	pthread_mutex_destroy(&g_clientmutex);
+	pthread_mutex_destroy(&g_mapmutex);
 }
 
 void daemon_run()
@@ -238,6 +326,15 @@ void* accept_thread_func(void* arg)
 		{
 			std::cout << "epoll_ctl error, fd =" << newfd << std::endl;
 		}
+
+		tcprecvpacket_t recvp;
+		recvp.connect_state = CONNECTED;
+		recvp.obj_process_pid = 0;//默认为0
+		gettimeofday(&(recvp.timestamp), NULL);//更新时间戳
+		pthread_mutex_lock(&g_mapmutex);
+		g_client_map[newfd] = recvp;//如果是相同的描述符直接覆盖
+		pthread_mutex_unlock(&g_mapmutex);
+
 	}
 
 	std::cout << "exit accept thread." << std::endl;
@@ -297,9 +394,31 @@ void* worker_thread_func(void* arg)
 
 		//出错了，就不要再继续往下执行了
 		if (bError)
+		{
 			continue;
+		}
+
 
 		std::cout << "client msg: " << strclientmsg.size() << ", " << strclientmsg << std::endl;
+
+		
+		//recvp.connect_state = WAITHEARTBEAT;
+		//gettimeofday(&(recvp.timestamp), NULL);//更新时间戳
+		if (strclientmsg.size() == 10)//长度限定
+		{
+			pthread_mutex_lock(&g_mapmutex);
+
+			std::map<int, tcprecvpacket_t>::iterator it;
+			it = g_client_map.find(clientfd);
+			if (it != g_client_map.end())
+			{
+				it->second.connect_state = WAITHEARTBEAT;
+				gettimeofday(&(it->second.timestamp), NULL);//更新时间戳.
+			}
+
+			pthread_mutex_unlock(&g_mapmutex);
+
+		}
 
 		////将消息加上时间标签后发回
 		//time_t now = time(NULL);
@@ -340,6 +459,68 @@ void* worker_thread_func(void* arg)
 	return NULL;
 }
 
+void* timer_thread_func(void* arg)
+{
+	
+	std::cout << "timer thread is running." << std::endl;
+	while (!g_bStop)
+	{
+		//std::cout << std::endl;
+		int ret = 0;
+		ret = pthread_mutex_trylock(&g_mapmutex);
+		if (ret != 0 && ret == EBUSY)
+		{
+			set_timer(0, 10);//10ms
+			continue;
+		}
+		else
+		{
+			std::map<int, tcprecvpacket_t>::iterator it = g_client_map.begin();
+			while (it != g_client_map.end())
+			{
+				if (g_bStop)break;
+				if (it->second.connect_state == WAITHEARTBEAT)
+				{
+					timeval current_tv;
+					gettimeofday(&(current_tv), NULL);//获取当前时间戳；
+					int64_t time_diff_ms = 0;//同一换算成ms
+					int64_t timeout_threshold_ms = 49000;//标准门限
+
+					time_diff_ms = ((int64_t)current_tv.tv_sec * 1000 + current_tv.tv_usec / 1000)
+						- ((int64_t)it->second.timestamp.tv_sec * 1000 + it->second.timestamp.tv_usec / 1000);
+
+					if (time_diff_ms > timeout_threshold_ms)//触发超时
+					{
+						std::cout << "fd:" << it->first <<", "<<"timeout! Reboot device after 3s"<< std::endl;
+						g_bStop = true;
+						//char tmp[100];
+						//bzero(tmp, 100);
+						//sprintf(tmp, "reboot");//重启设备
+						//pox_system(tmp);
+						set_timer(3, 0);//10ms
+					}
+					else//检查下一个
+					{
+						std::cout << "fd:" << it->first <<", "<< "heartbeat checking." << std::endl;
+					}
+				}
+				else
+				{
+				
+				}
+				it++;
+			}
+
+			pthread_mutex_unlock(&g_mapmutex);
+
+		}
+
+		set_timer(7, 20);
+	}
+
+	std::cout << "exit timer thread ." << std::endl;
+
+}
 int main(int argc, char* argv[])
 {
 
@@ -394,6 +575,7 @@ int main(int argc, char* argv[])
 	pthread_mutex_init(&g_mutex, NULL);
 
 	pthread_mutex_init(&g_clientmutex, NULL);
+	pthread_mutex_init(&g_mapmutex, NULL);
 
 	pthread_create(&g_acceptthreadid, NULL, accept_thread_func, NULL);
 
@@ -402,6 +584,8 @@ int main(int argc, char* argv[])
 	{
 		pthread_create(&g_threadid[i], NULL, worker_thread_func, NULL);
 	}
+
+	pthread_create(&g_timerthreadid, NULL, timer_thread_func, NULL);
 
 
 	while (!g_bStop)
@@ -438,6 +622,8 @@ int main(int argc, char* argv[])
 		}
 
 	}
+
+	prog_exit(0);
 
 	return 0;
 
