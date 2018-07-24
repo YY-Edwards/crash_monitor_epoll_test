@@ -137,45 +137,64 @@ void set_timer(int seconds, int useconds)
 
 void prog_exit(int signo)
 {
-	::signal(SIGINT, SIG_IGN);
-	::signal(SIGKILL, SIG_IGN);
-	::signal(SIGTERM, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGKILL, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
 
 	std::cout << "program recv signal " << signo << " to exit." << std::endl;
 
 	g_bStop = true;
 
-	pthread_join(g_timerthreadid, NULL);//等待回收线程
+	if (g_timerthreadid != 0)
+	{
+		pthread_join(g_timerthreadid, NULL);//等待回收线程
+		g_timerthreadid = 0;
+	}
+	
+	if (g_acceptthreadid != 0)
+	{
+		g_accept_run_flag = true;
+		pthread_cond_signal(&g_acceptcond);//通知accept线程退出
+		pthread_join(g_acceptthreadid, NULL);//等待回收线程
+		g_acceptthreadid = 0;
+	}
 
-	g_accept_run_flag = true;
-	pthread_cond_signal(&g_acceptcond);//通知accept线程退出
-	pthread_join(g_acceptthreadid, NULL);//等待回收线程
+	if (g_threadid[0] != 0 && g_threadid[1] != 0)
+	{
+		struct epoll_event ev;
+		ev.data.fd = 0;
+		pthread_mutex_lock(&g_clientmutex);//通知worker线程退出
+		g_listClients.push_back(ev.data.fd);
+		g_listClients.push_back(ev.data.fd);
+		pthread_mutex_unlock(&g_clientmutex);
+		pthread_cond_broadcast(&g_cond);
+		pthread_join(g_threadid[0], NULL);
+		pthread_join(g_threadid[1], NULL);//等待回收线程
+		g_threadid[0] = 0;
+		g_threadid[1] = 0;
+	}
 
-	struct epoll_event ev;
-	ev.data.fd = 0;
-	pthread_mutex_lock(&g_clientmutex);//通知worker线程退出
-	g_listClients.push_back(ev.data.fd);
-	g_listClients.push_back(ev.data.fd);
-	pthread_mutex_unlock(&g_clientmutex);
-	pthread_cond_broadcast(&g_cond);
-	pthread_join(g_threadid[0], NULL);
-	pthread_join(g_threadid[1], NULL);//等待回收线程
+	if (g_epollfd != 0 && g_listenfd != 0)
+	{
+		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_listenfd, NULL);//删除监听描述符
 
-	epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_listenfd, NULL);//删除监听描述符
+		//TODO: 是否需要先调用shutdown()一下？
+		shutdown(g_listenfd, SHUT_RDWR);
+		close(g_listenfd);
+		close(g_epollfd);
+		g_epollfd = 0;
+		g_listenfd = 0;
 
-	//TODO: 是否需要先调用shutdown()一下？
-	shutdown(g_listenfd, SHUT_RDWR);
-	close(g_listenfd);
-	close(g_epollfd);
+		pthread_cond_destroy(&g_acceptcond);
+		pthread_mutex_destroy(&g_acceptmutex);
 
-	pthread_cond_destroy(&g_acceptcond);
-	pthread_mutex_destroy(&g_acceptmutex);
+		pthread_cond_destroy(&g_cond);
+		pthread_mutex_destroy(&g_mutex);
 
-	pthread_cond_destroy(&g_cond);
-	pthread_mutex_destroy(&g_mutex);
+		pthread_mutex_destroy(&g_clientmutex);
+		pthread_mutex_destroy(&g_mapmutex);
+	}
 
-	pthread_mutex_destroy(&g_clientmutex);
-	pthread_mutex_destroy(&g_mapmutex);
 }
 
 void daemon_run()
@@ -548,15 +567,15 @@ int main(int argc, char* argv[])
 	if (port == 0)
 		port = 12345;
 
-	server_ip = get_local_ip_by_name(netcard_name);
-	if (server_ip.empty() == true)
+	//server_ip = get_local_ip_by_name(netcard_name);
+	//if (server_ip.empty() == true)
+	//{
+	//	std::cout << "Unable to get server ip" << std::endl;
+	//	return -1;
+	//}
+	if (!create_server_listener("127.0.0.1", port))
 	{
-		std::cout << "Unable to get server ip" << std::endl;
-		return -1;
-	}
-	if (!create_server_listener(server_ip.c_str(), port))
-	{
-		std::cout << "Unable to create listen server: ip=0.0.0.0, port=" << port << "." << std::endl;
+		std::cout << "Unable to create listen server: ip=127.0.0.1, port=" << port << "." << std::endl;
 		return -1;
 	}
 
@@ -586,7 +605,6 @@ int main(int argc, char* argv[])
 	}
 
 	pthread_create(&g_timerthreadid, NULL, timer_thread_func, NULL);
-
 
 	while (!g_bStop)
 	{
@@ -622,7 +640,7 @@ int main(int argc, char* argv[])
 		}
 
 	}
-
+	
 	prog_exit(0);
 
 	return 0;
