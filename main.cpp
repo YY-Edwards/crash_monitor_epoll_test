@@ -279,7 +279,11 @@ bool create_server_listener(const char* ip, short port)
 	if (listen(g_listenfd, 50) == -1)//设置最大监听数量
 		return false;
 
-	g_epollfd = epoll_create(1);//创建一个epoll句柄
+	//自从Linux2.6.8版本以后，size值其实是没什么用的，不过要大于0，因为内核可以动态的分配大小，所以不需要size这个提示了。
+	//它是fd的一个标识说明，用来设置文件close-on-exec状态的。
+	//当close-on-exec状态为0时，调用exec时，fd不会被关闭；状态非零时则会被关闭，这样做可以防止fd泄露给执行exec后的进程
+	//g_epollfd = epoll_create(1);//创建一个epoll句柄
+	g_epollfd = epoll_create1(EPOLL_CLOEXEC);
 	if (g_epollfd == -1)
 		return false;
 
@@ -312,13 +316,12 @@ void* accept_thread_func(void* arg)
 			if (g_bStop == true)break;
 			pthread_cond_wait(&g_acceptcond, &g_acceptmutex);
 		}
-		
+		g_accept_run_flag = false;//clear flag
+		pthread_mutex_unlock(&g_acceptmutex);
+
 		memset(&clientaddr, 0x00, sizeof(sockaddr_in));
 		socklen_t addrlen = sizeof(sockaddr_in);
 		int newfd = accept(g_listenfd, (struct sockaddr *)&clientaddr, &addrlen);
-		pthread_mutex_unlock(&g_acceptmutex);
-		std::cout << std::endl;
-		g_accept_run_flag = false;//clear flag
 		if (newfd == -1)
 		{
 			std::cout << "Accept fail! " << std::endl;
@@ -369,7 +372,9 @@ void* worker_thread_func(void* arg)
 		int clientfd;
 		pthread_mutex_lock(&g_clientmutex);
 		while (g_listClients.empty())
+		{
 			pthread_cond_wait(&g_cond, &g_clientmutex);
+		}
 		clientfd = g_listClients.front();//取出被激活的描述符
 		g_listClients.pop_front();
 		pthread_mutex_unlock(&g_clientmutex);
