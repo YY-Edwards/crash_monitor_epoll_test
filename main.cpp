@@ -38,8 +38,9 @@
 #include <assert.h>
 
 #define PROTO_HEADER_START   0xCD
-#define WORKER_THREAD_NUM   2
+#define WORKER_THREAD_NUM   1
 #define min(a, b) ((a <= b) ? (a) : (b)) 
+#define ETRYAGAIN(x)        (x==EAGAIN||x==EWOULDBLOCK||x==EINTR)  
 const uint16_t kProtoPacketMaxLen = 23;//bytes
 
 #pragma pack(1)
@@ -47,7 +48,7 @@ enum	CLIENTSTATE
 {
 	CONNECTING,//正在连接
 	WAITHEARTBEAT,//等待心跳，单向的
-	DISCONNECTED//已断开
+	TIMEOUT//已断开
 };
 
 typedef struct{
@@ -205,7 +206,7 @@ namespace daemonHeart
 			int ret = timerfd_settime(timerfd, 0, &newValue, &oldValue);
 			if (ret)
 			{
-				printf("timerfd_settime()");
+				printf("timerfd_settime() Err: %d", errno);
 			}
 		}
 
@@ -328,14 +329,17 @@ void prog_exit(int signo)
 	std::cout << "program recv signal " << signo << " to exit." << std::endl;
 
 	//停止定时器
-	daemonHeart::detail::resetTimerfd(g_timerFd, 0, 0, true);
+	if (g_timerFd != -1)
+	{
+		daemonHeart::detail::resetTimerfd(g_timerFd, 0, 0, true);
+	}
 	g_bStop = true;
 
-	if (g_timerthreadid != 0)
-	{
-		pthread_join(g_timerthreadid, NULL);//等待回收线程
-		g_timerthreadid = 0;
-	}
+	//if (g_timerthreadid != 0)
+	//{
+	//	pthread_join(g_timerthreadid, NULL);//等待回收线程
+	//	g_timerthreadid = 0;
+	//}
 	
 	if (g_acceptthreadid != 0)
 	{
@@ -345,19 +349,16 @@ void prog_exit(int signo)
 		g_acceptthreadid = 0;
 	}
 
-	if (g_threadid[0] != 0 && g_threadid[1] != 0)
+	if (g_threadid[0] != 0)
 	{
 		struct epoll_event ev;
 		ev.data.fd = 0;
 		pthread_mutex_lock(&g_listMutex);//通知worker线程退出
 		g_activeClients.push_back(ev.data.fd);
-		g_activeClients.push_back(ev.data.fd);
 		pthread_mutex_unlock(&g_listMutex);
 		pthread_cond_broadcast(&g_cond);
 		pthread_join(g_threadid[0], NULL);
-		pthread_join(g_threadid[1], NULL);//等待回收线程
 		g_threadid[0] = 0;
-		g_threadid[1] = 0;
 	}
 
 	if (g_epollfd != -1)
@@ -640,12 +641,17 @@ void* worker_thread_func(void* arg)
 {
 	std::cout << "worker thread is running." << std::endl;
 	//int8_t message[23] = {0};
+	//int8_t byteArray[256] = { 0 };
 	DeamonExternalMonitorProto_t message;
+	memset((void*)&message, 0x00, sizeof(message));
 	ClientInfo_t clientInfo;
 	int64_t now = 0;
+	uint32_t tcpRecvIdx = 0;
+	uint32_t udpRecvIdx = 0;
 	struct sockaddr peerAddr;
 	bzero(&peerAddr, sizeof peerAddr);
 	socklen_t addrLen = sizeof peerAddr;
+	bool recvOkay = false;
 
 	while (!g_bStop)
 	{
@@ -663,39 +669,88 @@ void* worker_thread_func(void* arg)
 		//gdb调试时不能实时刷新标准输出，用这个函数刷新标准输出，使信息在屏幕上实时显示出来
 		std::cout << std::endl;
 
-		memset((void*)&message, 0x00, sizeof(message));
 		if (clientfd == g_udpFd)//UDP
 		{	
-			ssize_t nr = recvfrom(clientfd, message.fragment, sizeof message.fragment, 0, &peerAddr, &addrLen);
+			ssize_t nr = recvfrom(clientfd, (message.fragment + udpRecvIdx), ((sizeof message.fragment) - udpRecvIdx), 0, &peerAddr, &addrLen);
 			std::cout << "recv udp message: " << nr << " bytes. "<< "from fd: "<< clientfd <<std::endl;
-			if ((nr > 0) && (nr <= kProtoPacketMaxLen))
+			udpRecvIdx += nr;
+			if (udpRecvIdx >= kProtoPacketMaxLen)//需要一个完整包
 			{
-				if (message.packet.header.start_byte == PROTO_HEADER_START)
-				{
-					printf("ip: %d.%d.%d.%d \r\n", message.packet.header.flag.ip[0], message.packet.header.flag.ip[1],
-						message.packet.header.flag.ip[2], message.packet.header.flag.ip[3]);
-					printf("port: %d \r\n", message.packet.header.flag.port);
-					printf("start_time: %lld \r\n", message.packet.header.flag.sTime);
-					printf("pid: %d \r\n", message.packet.header.flag.pid);
-					printf("appID: %d \r\n", message.packet.fileds.appID);
-					//std::cout << "ip: " << std::endl;
-					now = getNowTimestamp();
-					pthread_mutex_lock(&g_mapMutex);
-					if (g_connections.find(clientfd) != g_connections.end())
-					{
-						g_connections[clientfd].connectState = WAITHEARTBEAT;
-						g_connections[clientfd].lastRecvTimestamp = now;
-						memcpy(&g_connections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
-					}
-					pthread_mutex_unlock(&g_mapMutex);		
-
-				}
+				std::cout << "recv udp packet okay. " << std::endl;
+				udpRecvIdx = 0;
+				recvOkay = true;
 			}
 		}
 		else
 		{
-			std::cout << "recv tcp message. " << std::endl;
+			int nRecv = recv(clientfd, (message.fragment + tcpRecvIdx), ((sizeof message.fragment) - tcpRecvIdx), 0);
+			tcpRecvIdx += nRecv;
+			std::cout << "recv tcp message: " << nRecv << " bytes. " << "from fd: " << clientfd << std::endl;
+			if (nRecv < 0)
+			{
+				if (ETRYAGAIN(errno))//超时，或者被信号中断
+				{
+					continue;
+				}			
+				else
+				{
+					std::cout << "recv error, client disconnected, fd = " << clientfd << std::endl;
 
+					pthread_mutex_lock(&g_mapMutex);
+					if (g_connections.find(clientfd) != g_connections.end())
+					{
+						release_client(clientfd);//删除客户端描述符
+						g_connections.erase(clientfd);
+					}
+					pthread_mutex_unlock(&g_mapMutex);
+				}
+			}
+			else if (nRecv == 0)		//对端关闭了socket，这端也关闭。
+			{
+				std::cout << "peer closed, client disconnected, fd = " << clientfd << std::endl;
+				pthread_mutex_lock(&g_mapMutex);
+				if (g_connections.find(clientfd) != g_connections.end())
+				{
+					release_client(clientfd);//删除客户端描述符
+					g_connections.erase(clientfd);
+				}
+				pthread_mutex_unlock(&g_mapMutex);
+			}
+			else
+			{
+				if (tcpRecvIdx >= kProtoPacketMaxLen)
+				{
+					std::cout << "recv tcp packet okay. " << std::endl;
+					recvOkay = true;
+					tcpRecvIdx = 0;
+				}
+			}
+		}
+
+		if (recvOkay)
+		{
+			recvOkay = false;
+			if (message.packet.header.start_byte == PROTO_HEADER_START)
+			{
+				printf("ip: %d.%d.%d.%d \r\n", message.packet.header.flag.ip[0], message.packet.header.flag.ip[1],
+					message.packet.header.flag.ip[2], message.packet.header.flag.ip[3]);
+				printf("port: %d \r\n", message.packet.header.flag.port);
+				printf("start_time: %lld \r\n", message.packet.header.flag.sTime);
+				printf("pid: %d \r\n", message.packet.header.flag.pid);
+				printf("appID: %d \r\n", message.packet.fileds.appID);
+				//std::cout << "ip: " << std::endl;
+				now = getNowTimestamp();
+				pthread_mutex_lock(&g_mapMutex);
+				if (g_connections.find(clientfd) != g_connections.end())
+				{
+					g_connections[clientfd].connectState = WAITHEARTBEAT;
+					g_connections[clientfd].lastRecvTimestamp = now;
+					memcpy(&g_connections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
+				}
+				pthread_mutex_unlock(&g_mapMutex);
+
+			}
+			memset((void*)&message, 0x00, sizeof(message));
 		}
 
 		std::cout << std::endl;
@@ -979,7 +1034,7 @@ int main(int argc, char* argv[])
 								printf("port: %d \r\n", it->second.flag.port);
 								printf("start_time: %lld \r\n", it->second.flag.sTime);
 								printf("pid: %d \r\n", it->second.flag.pid);
-
+								it->second.connectState = TIMEOUT;
 								//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
 								//pox_system(shellCmd);
 
