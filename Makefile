@@ -5,16 +5,15 @@ C_FLAGS += -lpthread  -lrt    -O -g -Wl,--as-needed
 
 objs := $(patsubst %c, %o, $(shell ls *.cpp))
 
-INC += -I /usr/src/app/crash_monitor/src/   -I /usr/include/
+INC += -I /usr/src/app/crash_monitor/src/ 
 
-LIB +=  -L/usr/local/lib/   -L/usr/lib/  -L/usr/src/app/crash_monitor/lib/ 
+LIB +=  -L/usr/src/app/crash_monitor/lib/ 
 
-#-L./lib/libusb
 
 
 all: $(TARGET)
 
-crash_monitor_app: main.o 
+$(TARGET): main.o 
 
 	$(CXX) -o $@ $^ $(INC) $(LIB) $(C_FLAGS)
 

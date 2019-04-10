@@ -37,6 +37,7 @@
 #include <sys/time.h>
 #include <assert.h>
 
+#define PROTO_HEADER_START   0xCD
 #define WORKER_THREAD_NUM   2
 #define min(a, b) ((a <= b) ? (a) : (b)) 
 const uint16_t kProtoPacketMaxLen = 23;//bytes
@@ -107,7 +108,7 @@ typedef union{
 typedef struct{
 
 	CLIENTSTATE		connectState;//目标连接状态
-	int64_t			lastTimestamp;
+	int64_t			lastRecvTimestamp;
 	HeaderFlag_t	flag;
 
 }ClientInfo_t;
@@ -117,7 +118,7 @@ typedef struct{
 
 
 
-namespace daemon
+namespace daemonHeart
 {
 	namespace detail
 	{
@@ -127,7 +128,7 @@ namespace daemon
 			int evtfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 			if (evtfd < 0)
 			{
-				log_warning("Failed in eventfd");
+				printf("Failed in eventfd");
 				abort();
 			}
 			return evtfd;
@@ -149,7 +150,7 @@ namespace daemon
 			int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 			if (timerfd < 0)
 			{
-				log_warning("Failed in timerfd_create");
+				printf("Failed in timerfd_create");
 			}
 			return timerfd;
 		}
@@ -204,7 +205,7 @@ namespace daemon
 			int ret = timerfd_settime(timerfd, 0, &newValue, &oldValue);
 			if (ret)
 			{
-				log_warning("timerfd_settime()");
+				printf("timerfd_settime()");
 			}
 		}
 
@@ -224,17 +225,17 @@ int g_timerFd = -1;//定时描述符
 pthread_t g_acceptthreadid = 0;
 pthread_t g_timerthreadid = 0;
 pthread_t g_threadid[WORKER_THREAD_NUM] = { 0 };
-pthread_cond_t g_acceptcond;
-pthread_mutex_t g_acceptmutex;
+pthread_cond_t g_acceptCond;
+pthread_mutex_t g_acceptMutex;
 
 pthread_cond_t g_cond /*= PTHREAD_COND_INITIALIZER*/;
 pthread_mutex_t g_mutex /*= PTHREAD_MUTEX_INITIALIZER*/;
 
-pthread_mutex_t g_clientmutex;
-pthread_mutex_t g_mapmutex;
+pthread_mutex_t g_listMutex;
+pthread_mutex_t g_mapMutex;
 
 std::list<int> g_activeClients;
-std::map<int, ClientInfo_t> g_tcpConnections;
+std::map<int, ClientInfo_t> g_connections;
 //std::map<int, tcprecvpacket_t> g_client_map;//客户端map
 
 const char* kLoopBack = "127.0.0.1";
@@ -296,7 +297,13 @@ int64_t getNowTimestamp()
 
 }
 
+void release_client(int clientfd)
+{
+	if (epoll_ctl(g_epollfd, EPOLL_CTL_DEL, clientfd, NULL) == -1)
+		std::cout << "release client socket failed as call epoll_ctl failed" << std::endl;
 
+	close(clientfd);
+}
 void set_timer(int seconds, int useconds)
 {
 
@@ -321,7 +328,7 @@ void prog_exit(int signo)
 	std::cout << "program recv signal " << signo << " to exit." << std::endl;
 
 	//停止定时器
-	daemon::detail::resetTimerfd(g_timerFd, 0, 0, true);
+	daemonHeart::detail::resetTimerfd(g_timerFd, 0, 0, true);
 	g_bStop = true;
 
 	if (g_timerthreadid != 0)
@@ -333,7 +340,7 @@ void prog_exit(int signo)
 	if (g_acceptthreadid != 0)
 	{
 		g_accept_run_flag = true;
-		pthread_cond_signal(&g_acceptcond);//通知accept线程退出
+		pthread_cond_signal(&g_acceptCond);//通知accept线程退出
 		pthread_join(g_acceptthreadid, NULL);//等待回收线程
 		g_acceptthreadid = 0;
 	}
@@ -342,10 +349,10 @@ void prog_exit(int signo)
 	{
 		struct epoll_event ev;
 		ev.data.fd = 0;
-		pthread_mutex_lock(&g_clientmutex);//通知worker线程退出
+		pthread_mutex_lock(&g_listMutex);//通知worker线程退出
 		g_activeClients.push_back(ev.data.fd);
 		g_activeClients.push_back(ev.data.fd);
-		pthread_mutex_unlock(&g_clientmutex);
+		pthread_mutex_unlock(&g_listMutex);
 		pthread_cond_broadcast(&g_cond);
 		pthread_join(g_threadid[0], NULL);
 		pthread_join(g_threadid[1], NULL);//等待回收线程
@@ -355,32 +362,37 @@ void prog_exit(int signo)
 
 	if (g_epollfd != -1)
 	{
-		while ()
+		int tempFd = -1;
+		pthread_mutex_lock(&g_mapMutex);
+		for (std::map<int, ClientInfo_t>::iterator it = g_connections.begin(); it != g_connections.end();)
 		{
-
+			tempFd = it->first;
+			release_client(tempFd);//删除客户端描述符
+			g_connections.erase(it++);
 		}
-		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_listenfd, NULL);//删除监听描述符
-		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_udpFd, NULL);//删除监听描述符
-		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_timerFd, NULL);//删除监听描述符
+		pthread_mutex_unlock(&g_mapMutex);
 
+
+		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_listenfd, NULL);//删除监听描述符
+		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_timerFd, NULL);//删除定时器描述符
 
 		//TODO: 是否需要先调用shutdown()一下？
 		shutdown(g_listenfd, SHUT_RDWR);
 		close(g_listenfd);
-		close(g_epollfd);
 		close(g_timerFd);
-		g_epollfd = 0;
-		g_listenfd = 0;
-		g_timerFd = 0;
+		close(g_epollfd);
+		g_epollfd = -1;
+		g_listenfd = -1;
+		g_timerFd = -1;
 
-		pthread_cond_destroy(&g_acceptcond);
-		pthread_mutex_destroy(&g_acceptmutex);
+		pthread_cond_destroy(&g_acceptCond);
+		pthread_mutex_destroy(&g_acceptMutex);
 
 		pthread_cond_destroy(&g_cond);
 		pthread_mutex_destroy(&g_mutex);
 
-		pthread_mutex_destroy(&g_clientmutex);
-		pthread_mutex_destroy(&g_mapmutex);
+		pthread_mutex_destroy(&g_listMutex);
+		pthread_mutex_destroy(&g_mapMutex);
 	}
 
 	std::cout << "release resource okay. "<< std::endl;
@@ -506,7 +518,7 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 		return false;
 
 	//create timerfd
-	g_timerFd = daemon::detail::createTimerfd();
+	g_timerFd = daemonHeart::detail::createTimerfd();
 	assert(g_timerFd >= 0);
 
 
@@ -518,26 +530,37 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 		return false;
 
 	memset(&e, 0, sizeof(e));
-	e.events = EPOLLIN | POLLPRI;//注册事件：可读/外带
+	e.events = EPOLLIN | EPOLLPRI;//注册事件：可读/外带
 	e.data.fd = g_udpFd;
 	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_udpFd, &e) == -1)//注册新的UDP-fd到g_epollfd。
 		return false;
 
+
+
+	ClientInfo_t clientInfo;
+	int64_t now = getNowTimestamp();
+	clientInfo.lastRecvTimestamp = now;
+	clientInfo.connectState = CONNECTING;
+	clientInfo.flag.pid = 0;
+
+	pthread_mutex_lock(&g_mapMutex);
+	g_connections[g_udpFd] = clientInfo;
+	pthread_mutex_unlock(&g_mapMutex);
+
+
+
+
 	memset(&e, 0, sizeof(e));
-	e.events = EPOLLIN | POLLPRI;//注册事件：可读/外带
+	e.events = EPOLLIN | EPOLLPRI;//注册事件：可读/外带
 	e.data.fd = g_timerFd;
 	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_timerFd, &e) == -1)//注册新的timer-fd到g_epollfd。
 		return false;
 
 
-	return true;
-}
-void release_client(int clientfd)
-{
-	if (epoll_ctl(g_epollfd, EPOLL_CTL_DEL, clientfd, NULL) == -1)
-		std::cout << "release client socket failed as call epoll_ctl failed" << std::endl;
 
-	close(clientfd);
+
+
+	return true;
 }
 
 void* accept_thread_func(void* arg)
@@ -546,14 +569,14 @@ void* accept_thread_func(void* arg)
 	struct sockaddr_in clientaddr;
 	while (!g_bStop)
 	{
-		pthread_mutex_lock(&g_acceptmutex);
+		pthread_mutex_lock(&g_acceptMutex);
 		while (g_accept_run_flag == false)//防止意外唤醒
 		{
 			if (g_bStop == true)break;
-			pthread_cond_wait(&g_acceptcond, &g_acceptmutex);
+			pthread_cond_wait(&g_acceptCond, &g_acceptMutex);
 		}
 		g_accept_run_flag = false;//clear flag
-		pthread_mutex_unlock(&g_acceptmutex);
+		pthread_mutex_unlock(&g_acceptMutex);
 
 		memset(&clientaddr, 0x00, sizeof(sockaddr_in));
 		socklen_t addrlen = sizeof(sockaddr_in);
@@ -578,7 +601,7 @@ void* accept_thread_func(void* arg)
 
 		struct epoll_event e;
 		memset(&e, 0, sizeof(e));
-		e.events = EPOLLIN | POLLPRI| EPOLLRDHUP;//事件：可读、外带、挂断(默认水平触发)
+		e.events = EPOLLIN | EPOLLPRI | EPOLLRDHUP;//事件：可读、外带、挂断(默认水平触发)
 		e.data.fd = newfd;
 		if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, newfd, &e) == -1)//为新加入的描述符注册
 		{
@@ -591,19 +614,20 @@ void* accept_thread_func(void* arg)
 		//recvp.connect_state = CONNECTED;
 		//recvp.obj_process_pid = 0;//默认为0
 		//gettimeofday(&(recvp.timestamp), NULL);//更新时间戳
-		//pthread_mutex_lock(&g_mapmutex);
+		//pthread_mutex_lock(&g_mapMutex);
 		//g_client_map[newfd] = recvp;//如果是相同的描述符直接覆盖
-		//pthread_mutex_unlock(&g_mapmutex);
+		//pthread_mutex_unlock(&g_mapMutex);
 
 		ClientInfo_t clientInfo;
 		int64_t now = getNowTimestamp();
-		clientInfo.lastTimestamp = now;
+		clientInfo.lastRecvTimestamp = now;
 		clientInfo.connectState = CONNECTING;
+		clientInfo.flag.pid = 0;
 
-		pthread_mutex_lock(&g_mapmutex);
-		g_tcpConnections[newfd] = clientInfo;
+		pthread_mutex_lock(&g_mapMutex);
+		g_connections[newfd] = clientInfo;
 		//g_client_map[newfd] = recvp;//如果是相同的描述符直接覆盖
-		pthread_mutex_unlock(&g_mapmutex);
+		pthread_mutex_unlock(&g_mapMutex);
 
 	}
 
@@ -617,6 +641,8 @@ void* worker_thread_func(void* arg)
 	std::cout << "worker thread is running." << std::endl;
 	//int8_t message[23] = {0};
 	DeamonExternalMonitorProto_t message;
+	ClientInfo_t clientInfo;
+	int64_t now = 0;
 	struct sockaddr peerAddr;
 	bzero(&peerAddr, sizeof peerAddr);
 	socklen_t addrLen = sizeof peerAddr;
@@ -624,33 +650,46 @@ void* worker_thread_func(void* arg)
 	while (!g_bStop)
 	{
 		int clientfd = -1;
-		pthread_mutex_lock(&g_clientmutex);
+		pthread_mutex_lock(&g_listMutex);
 		while (g_activeClients.empty())
 		{
-			pthread_cond_wait(&g_cond, &g_clientmutex);
+			pthread_cond_wait(&g_cond, &g_listMutex);
 		}
 		clientfd = g_activeClients.front();//取出被激活的描述符
 		g_activeClients.pop_front();
-		pthread_mutex_unlock(&g_clientmutex);
+		pthread_mutex_unlock(&g_listMutex);
 
 		if ((g_bStop == true) || (clientfd < 0))break;
 		//gdb调试时不能实时刷新标准输出，用这个函数刷新标准输出，使信息在屏幕上实时显示出来
 		std::cout << std::endl;
 
-		if (clientfd == g_udpFd)
-		{
-			memset(message, 0x00, sizeof(message));
+		memset((void*)&message, 0x00, sizeof(message));
+		if (clientfd == g_udpFd)//UDP
+		{	
 			ssize_t nr = recvfrom(clientfd, message.fragment, sizeof message.fragment, 0, &peerAddr, &addrLen);
-			std::cout << "recv udp message: " << nr << " bytes. "<< std::endl;
+			std::cout << "recv udp message: " << nr << " bytes. "<< "from fd: "<< clientfd <<std::endl;
 			if ((nr > 0) && (nr <= kProtoPacketMaxLen))
 			{
-				printf("ip: %d.%d.%d.%d \r\n", message.packet.header.flag.ip[0], message.packet.header.flag.ip[1],
-					message.packet.header.flag.ip[2], message.packet.header.flag.ip[3]);
-				printf("port: %d \r\n", message.packet.header.flag.port);
-				printf("start_time: %ld \r\n", message.packet.header.flag.sTime);
-				printf("pid: %d \r\n", message.packet.header.flag.pid);
-				printf("appID: %d \r\n", message.packet.fileds.appID);
-				//std::cout << "ip: " << std::endl;
+				if (message.packet.header.start_byte == PROTO_HEADER_START)
+				{
+					printf("ip: %d.%d.%d.%d \r\n", message.packet.header.flag.ip[0], message.packet.header.flag.ip[1],
+						message.packet.header.flag.ip[2], message.packet.header.flag.ip[3]);
+					printf("port: %d \r\n", message.packet.header.flag.port);
+					printf("start_time: %lld \r\n", message.packet.header.flag.sTime);
+					printf("pid: %d \r\n", message.packet.header.flag.pid);
+					printf("appID: %d \r\n", message.packet.fileds.appID);
+					//std::cout << "ip: " << std::endl;
+					now = getNowTimestamp();
+					pthread_mutex_lock(&g_mapMutex);
+					if (g_connections.find(clientfd) != g_connections.end())
+					{
+						g_connections[clientfd].connectState = WAITHEARTBEAT;
+						g_connections[clientfd].lastRecvTimestamp = now;
+						memcpy(&g_connections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
+					}
+					pthread_mutex_unlock(&g_mapMutex);		
+
+				}
 			}
 		}
 		else
@@ -659,7 +698,7 @@ void* worker_thread_func(void* arg)
 
 		}
 
-
+		std::cout << std::endl;
 		//std::string strclientmsg="";
 		//char buff[256];
 		//bool bError = false;
@@ -703,7 +742,7 @@ void* worker_thread_func(void* arg)
 		//gettimeofday(&(recvp.timestamp), NULL);//更新时间戳
 		//if (strclientmsg.size() == 10)//长度限定
 		//{
-		//	pthread_mutex_lock(&g_mapmutex);
+		//	pthread_mutex_lock(&g_mapMutex);
 		//	std::map<int, tcprecvpacket_t>::iterator it;
 		//	it = g_client_map.find(clientfd);
 		//	if (it != g_client_map.end())
@@ -711,7 +750,7 @@ void* worker_thread_func(void* arg)
 		//		it->second.connect_state = WAITHEARTBEAT;
 		//		gettimeofday(&(it->second.timestamp), NULL);//更新时间戳.
 		//	}
-		//	pthread_mutex_unlock(&g_mapmutex);
+		//	pthread_mutex_unlock(&g_mapMutex);
 		//}
 
 		////将消息加上时间标签后发回
@@ -761,7 +800,7 @@ void* worker_thread_func(void* arg)
 //	{
 //		//std::cout << std::endl;
 //		int ret = 0;
-//		ret = pthread_mutex_trylock(&g_mapmutex);
+//		ret = pthread_mutex_trylock(&g_mapMutex);
 //		if (ret != 0 && ret == EBUSY)
 //		{
 //			set_timer(0, 10);//10ms
@@ -805,7 +844,7 @@ void* worker_thread_func(void* arg)
 //				it++;
 //			}
 //
-//			pthread_mutex_unlock(&g_mapmutex);
+//			pthread_mutex_unlock(&g_mapMutex);
 //
 //		}
 //
@@ -818,12 +857,12 @@ void* worker_thread_func(void* arg)
 int main(int argc, char* argv[])
 {
 
-	short port = 0;
+	//short port = 0;
 	int ch;
 	bool bdaemon = false;
-	const char * netcard_name = "eth0:virtual-7";
+	//const char * netcard_name = "eth0:virtual-7";
 	std::string server_ip = "";
-	while ((ch = getopt(argc, argv, "p:d")) != -1)
+	while ((ch = getopt(argc, argv, "p:d:s:")) != -1)
 	{
 		switch (ch)
 		{
@@ -831,7 +870,12 @@ int main(int argc, char* argv[])
 			bdaemon = true;
 			break;
 		case 'p':
-			port = atol(optarg);//获取外部设置的端口号
+			//port = atol(optarg);//获取外部设置的端口号
+		case 's':
+			printf("Have option -s \r\n");
+			printf("The argument of -s is %s\n\n", optarg);
+			printf("start debug mode. \r\n");
+			server_ip = optarg;//获取外部设置的ip
 			break;
 		}
 	}
@@ -839,8 +883,8 @@ int main(int argc, char* argv[])
 	if (bdaemon)
 		daemon_run();
 
-	if (port == 0)
-		port = 12345;
+	//if (port == 0)
+	//	port = 12345;
 
 	//server_ip = get_local_ip_by_name(netcard_name);
 	//if (server_ip.empty() == true)
@@ -848,11 +892,6 @@ int main(int argc, char* argv[])
 	//	std::cout << "Unable to get server ip" << std::endl;
 	//	return -1;
 	//}
-	if (!create_server_listener(kLoopBack, kTcpPort, kLoopBack, kUdpPort))
-	{
-		std::cout << "Unable to create listen server: ip=127.0.0.1, port=" << kTcpPort << "." << std::endl;
-		return -1;
-	}
 
 	g_activeClients.clear();
 	//设置信号处理
@@ -862,14 +901,24 @@ int main(int argc, char* argv[])
 	signal(SIGKILL, prog_exit);
 	signal(SIGTERM, prog_exit);
 
-	pthread_cond_init(&g_acceptcond, NULL);
-	pthread_mutex_init(&g_acceptmutex, NULL);
+	pthread_cond_init(&g_acceptCond, NULL);
+	pthread_mutex_init(&g_acceptMutex, NULL);
 
 	pthread_cond_init(&g_cond, NULL);
 	pthread_mutex_init(&g_mutex, NULL);
 
-	pthread_mutex_init(&g_clientmutex, NULL);
-	pthread_mutex_init(&g_mapmutex, NULL);
+	pthread_mutex_init(&g_listMutex, NULL);
+	pthread_mutex_init(&g_mapMutex, NULL);
+
+
+
+	if (!create_server_listener(server_ip.c_str(), kTcpPort, server_ip.c_str(), kUdpPort))
+	//if (!create_server_listener(kLoopBack, kTcpPort, kLoopBack, kUdpPort))
+	{
+		std::cout << "Unable to create listen server: ip=127.0.0.1, port=" << kTcpPort << "." << std::endl;
+		return -1;
+	}
+
 
 	pthread_create(&g_acceptthreadid, NULL, accept_thread_func, NULL);
 
@@ -882,9 +931,10 @@ int main(int argc, char* argv[])
 	//pthread_create(&g_timerthreadid, NULL, timer_thread_func, NULL);
 
 	//启动定时器
-	daemon::detail::resetTimerfd(g_timerFd, 0, kTimerCycle, false);
+	daemonHeart::detail::resetTimerfd(g_timerFd, 0, kTimerCycle, false);
 
-
+	int64_t now = 0;
+	char shellCmd[100] = { 0 };
 	while (!g_bStop)
 	{
 		struct epoll_event ev[10];
@@ -898,6 +948,7 @@ int main(int argc, char* argv[])
 		}
 		else
 		{
+			std::cout << "epoll_wait take =>  " << n  << " fd(s)." <<  std::endl;
 			//int m = min(n, 1024);//最大只能取到1024
 			for (int i = 0; i < n; ++i)
 			{
@@ -905,11 +956,45 @@ int main(int argc, char* argv[])
 				if (ev[i].data.fd == g_listenfd)
 				{
 					g_accept_run_flag = true;
-					pthread_cond_signal(&g_acceptcond);
+					pthread_cond_signal(&g_acceptCond);
 				}
 				else if (ev[i].data.fd == g_timerFd)//定时任务事件
 				{
 					std::cout << "epoll_wait: g_timerFd. " << std::endl;
+					//读取事件，如果不读取由于Epoll水平触发会导致一直有IO事件产生
+					//非阻塞的描述，不用担心线程堵塞
+					daemonHeart::detail::readTimerfd(g_timerFd);
+					now = getNowTimestamp();
+					pthread_mutex_lock(&g_mapMutex);
+					for (std::map<int, ClientInfo_t>::iterator it = g_connections.begin(); it != g_connections.end(); it++)
+					{
+						if (it->second.connectState == WAITHEARTBEAT)
+						{
+							if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
+							{
+								printf("fd=>%d heart timeout ! \r\n", it->first);
+								printf("client info: \r\n");
+								printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
+									it->second.flag.ip[2], it->second.flag.ip[3]);
+								printf("port: %d \r\n", it->second.flag.port);
+								printf("start_time: %lld \r\n", it->second.flag.sTime);
+								printf("pid: %d \r\n", it->second.flag.pid);
+
+								//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+								//pox_system(shellCmd);
+
+							}
+							else
+							{
+								printf("\r\nfd=>%d heart oaky. \r\n", it->first);
+							}
+						}
+
+					}
+
+
+					pthread_mutex_unlock(&g_mapMutex);
+					
 				}
 				//else if (ev[i].data.fd == g_udpFd)//UDP可读事件
 				//{
@@ -917,9 +1002,9 @@ int main(int argc, char* argv[])
 				//通知普通工作线程接收数据
 				else//客户端可读事件(tcp/udp)
 				{
-					pthread_mutex_lock(&g_clientmutex);
+					pthread_mutex_lock(&g_listMutex);
 					g_activeClients.push_back(ev[i].data.fd);
-					pthread_mutex_unlock(&g_clientmutex);
+					pthread_mutex_unlock(&g_listMutex);
 					pthread_cond_signal(&g_cond);
 					//std::cout << "signal" << std::endl;
 				}
