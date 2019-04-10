@@ -648,7 +648,7 @@ void* worker_thread_func(void* arg)
 	int64_t now = 0;
 	uint32_t tcpRecvIdx = 0;
 	uint32_t udpRecvIdx = 0;
-	struct sockaddr peerAddr;
+	struct sockaddr_in peerAddr;
 	bzero(&peerAddr, sizeof peerAddr);
 	socklen_t addrLen = sizeof peerAddr;
 	bool recvOkay = false;
@@ -671,8 +671,9 @@ void* worker_thread_func(void* arg)
 
 		if (clientfd == g_udpFd)//UDP
 		{	
-			ssize_t nr = recvfrom(clientfd, (message.fragment + udpRecvIdx), ((sizeof message.fragment) - udpRecvIdx), 0, &peerAddr, &addrLen);
-			std::cout << "recv udp message: " << nr << " bytes. "<< "from fd: "<< clientfd <<std::endl;
+			ssize_t nr = recvfrom(clientfd, (message.fragment + udpRecvIdx), ((sizeof message.fragment) - udpRecvIdx), 0, (struct sockaddr *)&peerAddr, &addrLen);
+			std::cout << "recv udp message: " << nr << " bytes. "<< "from fd: "<< clientfd 
+				<< ", and IpPort => " << inet_ntoa(peerAddr.sin_addr) << ":" << ntohs(peerAddr.sin_port) << std::endl;
 			udpRecvIdx += nr;
 			if (udpRecvIdx >= kProtoPacketMaxLen)//需要一个完整包
 			{
