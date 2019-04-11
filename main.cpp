@@ -236,7 +236,8 @@ pthread_mutex_t g_listMutex;
 pthread_mutex_t g_mapMutex;
 
 std::list<int> g_activeClients;
-std::map<int, ClientInfo_t> g_connections;
+std::map<int, ClientInfo_t> g_tcpConnections;
+std::map<std::string, ClientInfo_t> g_udpConnections;
 //std::map<int, tcprecvpacket_t> g_client_map;//客户端map
 
 const char* kLoopBack = "127.0.0.1";
@@ -365,26 +366,35 @@ void prog_exit(int signo)
 	{
 		int tempFd = -1;
 		pthread_mutex_lock(&g_mapMutex);
-		for (std::map<int, ClientInfo_t>::iterator it = g_connections.begin(); it != g_connections.end();)
+
+		for (std::map<std::string, ClientInfo_t>::iterator it = g_udpConnections.begin(); it != g_udpConnections.end();)
+		{
+			g_udpConnections.erase(it++);
+		}
+
+		for (std::map<int, ClientInfo_t>::iterator it = g_tcpConnections.begin(); it != g_tcpConnections.end();)
 		{
 			tempFd = it->first;
-			release_client(tempFd);//删除客户端描述符
-			g_connections.erase(it++);
+			release_client(tempFd);//删除tcp客户端描述符
+			g_tcpConnections.erase(it++);
 		}
 		pthread_mutex_unlock(&g_mapMutex);
 
 
 		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_listenfd, NULL);//删除监听描述符
 		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_timerFd, NULL);//删除定时器描述符
+		epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_udpFd, NULL);//删除udp描述符
 
 		//TODO: 是否需要先调用shutdown()一下？
 		shutdown(g_listenfd, SHUT_RDWR);
 		close(g_listenfd);
 		close(g_timerFd);
+		close(g_udpFd);
 		close(g_epollfd);
 		g_epollfd = -1;
 		g_listenfd = -1;
 		g_timerFd = -1;
+		g_udpFd = -1;
 
 		pthread_cond_destroy(&g_acceptCond);
 		pthread_mutex_destroy(&g_acceptMutex);
@@ -538,15 +548,15 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 
 
 
-	ClientInfo_t clientInfo;
+	/*ClientInfo_t clientInfo;
 	int64_t now = getNowTimestamp();
 	clientInfo.lastRecvTimestamp = now;
 	clientInfo.connectState = CONNECTING;
 	clientInfo.flag.pid = 0;
 
 	pthread_mutex_lock(&g_mapMutex);
-	g_connections[g_udpFd] = clientInfo;
-	pthread_mutex_unlock(&g_mapMutex);
+	g_tcpConnections[g_udpFd] = clientInfo;
+	pthread_mutex_unlock(&g_mapMutex);*/
 
 
 
@@ -626,7 +636,7 @@ void* accept_thread_func(void* arg)
 		clientInfo.flag.pid = 0;
 
 		pthread_mutex_lock(&g_mapMutex);
-		g_connections[newfd] = clientInfo;
+		g_tcpConnections[newfd] = clientInfo;
 		//g_client_map[newfd] = recvp;//如果是相同的描述符直接覆盖
 		pthread_mutex_unlock(&g_mapMutex);
 
@@ -698,10 +708,10 @@ void* worker_thread_func(void* arg)
 					std::cout << "recv error, client disconnected, fd = " << clientfd << std::endl;
 
 					pthread_mutex_lock(&g_mapMutex);
-					if (g_connections.find(clientfd) != g_connections.end())
+					if (g_tcpConnections.find(clientfd) != g_tcpConnections.end())
 					{
 						release_client(clientfd);//删除客户端描述符
-						g_connections.erase(clientfd);
+						g_tcpConnections.erase(clientfd);
 					}
 					pthread_mutex_unlock(&g_mapMutex);
 				}
@@ -710,10 +720,10 @@ void* worker_thread_func(void* arg)
 			{
 				std::cout << "peer closed, client disconnected, fd = " << clientfd << std::endl;
 				pthread_mutex_lock(&g_mapMutex);
-				if (g_connections.find(clientfd) != g_connections.end())
+				if (g_tcpConnections.find(clientfd) != g_tcpConnections.end())
 				{
 					release_client(clientfd);//删除客户端描述符
-					g_connections.erase(clientfd);
+					g_tcpConnections.erase(clientfd);
 				}
 				pthread_mutex_unlock(&g_mapMutex);
 			}
@@ -733,20 +743,37 @@ void* worker_thread_func(void* arg)
 			recvOkay = false;
 			if (message.packet.header.start_byte == PROTO_HEADER_START)
 			{
-				printf("ip: %d.%d.%d.%d \r\n", message.packet.header.flag.ip[0], message.packet.header.flag.ip[1],
-					message.packet.header.flag.ip[2], message.packet.header.flag.ip[3]);
-				printf("port: %d \r\n", message.packet.header.flag.port);
-				printf("start_time: %lld \r\n", message.packet.header.flag.sTime);
-				printf("pid: %d \r\n", message.packet.header.flag.pid);
+				char buf[64] = "";
+				sprintf(buf, "%d.%d.%d.%d:%u:%lld:%u",
+					message.packet.header.flag.ip[0],
+					message.packet.header.flag.ip[1],
+					message.packet.header.flag.ip[2],
+					message.packet.header.flag.ip[3],
+					message.packet.header.flag.port,
+					message.packet.header.flag.sTime,
+					message.packet.header.flag.pid);
+				std::string identityKey = buf;
+				printf("identityKey: %s \r\n", identityKey.c_str());
 				printf("appID: %d \r\n", message.packet.fileds.appID);
-				//std::cout << "ip: " << std::endl;
+
 				now = getNowTimestamp();
+
 				pthread_mutex_lock(&g_mapMutex);
-				if (g_connections.find(clientfd) != g_connections.end())
+				if (clientfd == g_udpFd)//UDP客户端
+				{		
+					//直接下标操作，不存在则直接新插入
+					g_udpConnections[identityKey].connectState = WAITHEARTBEAT;
+					g_udpConnections[identityKey].lastRecvTimestamp = now;
+					memcpy(&g_udpConnections[identityKey].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
+				}
+				else//TCP客户端
 				{
-					g_connections[clientfd].connectState = WAITHEARTBEAT;
-					g_connections[clientfd].lastRecvTimestamp = now;
-					memcpy(&g_connections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
+					if (g_tcpConnections.find(clientfd) != g_tcpConnections.end())
+					{
+						g_tcpConnections[clientfd].connectState = WAITHEARTBEAT;
+						g_tcpConnections[clientfd].lastRecvTimestamp = now;
+						memcpy(&g_tcpConnections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
+					}
 				}
 				pthread_mutex_unlock(&g_mapMutex);
 
@@ -1021,34 +1048,67 @@ int main(int argc, char* argv[])
 					//非阻塞的描述，不用担心线程堵塞
 					daemonHeart::detail::readTimerfd(g_timerFd);
 					now = getNowTimestamp();
-					pthread_mutex_lock(&g_mapMutex);
-					for (std::map<int, ClientInfo_t>::iterator it = g_connections.begin(); it != g_connections.end(); it++)
-					{
-						if (it->second.connectState == WAITHEARTBEAT)
-						{
-							if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
-							{
-								printf("fd=>%d heart timeout ! \r\n", it->first);
-								printf("client info: \r\n");
-								printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
-									it->second.flag.ip[2], it->second.flag.ip[3]);
-								printf("port: %d \r\n", it->second.flag.port);
-								printf("start_time: %lld \r\n", it->second.flag.sTime);
-								printf("pid: %d \r\n", it->second.flag.pid);
-								it->second.connectState = TIMEOUT;
-								//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
-								//pox_system(shellCmd);
 
-							}
-							else
+					pthread_mutex_lock(&g_mapMutex);
+					{
+						//polling udp client
+						for (std::map<std::string, ClientInfo_t>::iterator it = g_udpConnections.begin(); it != g_udpConnections.end();)
+						{
+							if (it->second.connectState == WAITHEARTBEAT)
 							{
-								printf("\r\nfd=>%d heart oaky. \r\n", it->first);
+								if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
+								{
+									printf("udp-identity=>%s heart timeout ! \r\n", it->first.c_str());
+									printf("client info: \r\n");
+									printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
+										it->second.flag.ip[2], it->second.flag.ip[3]);
+									printf("port: %d \r\n", it->second.flag.port);
+									printf("start_time: %lld \r\n", it->second.flag.sTime);
+									printf("pid: %d \r\n", it->second.flag.pid);
+									it->second.connectState = TIMEOUT;
+									//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+									//pox_system(shellCmd);
+									//杀死对方进程后，udp-client需要手动注销
+									g_udpConnections.erase(it++);//先删除当前，然后令当前迭代器指向其后继。
+
+								}
+								else
+								{
+									printf("\r\nudp-identity=>%s heart oaky. \r\n", it->first.c_str());
+									++it;
+								}
 							}
 						}
 
+						//polling tcp client
+						for (std::map<int, ClientInfo_t>::iterator it = g_tcpConnections.begin(); it != g_tcpConnections.end(); it++)
+						{
+							if (it->second.connectState == WAITHEARTBEAT)
+							{
+								if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
+								{
+									printf("fd=>%d heart timeout ! \r\n", it->first);
+									printf("client info: \r\n");
+									printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
+										it->second.flag.ip[2], it->second.flag.ip[3]);
+									printf("port: %d \r\n", it->second.flag.port);
+									printf("start_time: %lld \r\n", it->second.flag.sTime);
+									printf("pid: %d \r\n", it->second.flag.pid);
+									it->second.connectState = TIMEOUT;
+									//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+									//pox_system(shellCmd);
+									//杀死对方进程后，
+									//操作系统会关闭意外退出进程中使用的tcp-socket，并会往本进程发送FIN分节，此时服务端即可注销客户端描述符
+
+								}
+								else
+								{
+									printf("\r\ntcp-fd=>%d heart oaky. \r\n", it->first);
+								}
+							}
+
+						}
 					}
-
-
 					pthread_mutex_unlock(&g_mapMutex);
 					
 				}
