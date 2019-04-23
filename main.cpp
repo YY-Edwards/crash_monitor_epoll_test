@@ -1010,8 +1010,8 @@ int main(int argc, char* argv[])
 
 
 
-	if (!create_server_listener(server_ip.c_str(), kTcpPort, server_ip.c_str(), kUdpPort))
-	//if (!create_server_listener(kLoopBack, kTcpPort, kLoopBack, kUdpPort))
+	//if (!create_server_listener(server_ip.c_str(), kTcpPort, server_ip.c_str(), kUdpPort))
+	if (!create_server_listener(kLoopBack, kTcpPort, kLoopBack, kUdpPort))
 	{
 		std::cout << "Unable to create listen server: ip=127.0.0.1, port=" << kTcpPort << "." << std::endl;
 		return -1;
