@@ -682,20 +682,34 @@ void* worker_thread_func(void* arg)
 		if (clientfd == g_udpFd)//UDP
 		{	
 			ssize_t nr = recvfrom(clientfd, (message.fragment + udpRecvIdx), ((sizeof message.fragment) - udpRecvIdx), 0, (struct sockaddr *)&peerAddr, &addrLen);
-			std::cout << "recv udp message: " << nr << " bytes. "<< "from fd: "<< clientfd 
-				<< ", and IpPort => " << inet_ntoa(peerAddr.sin_addr) << ":" << ntohs(peerAddr.sin_port) << std::endl;
-			udpRecvIdx += nr;
-			if (udpRecvIdx >= kProtoPacketMaxLen)//需要一个完整包
+			if (nr < 0)
 			{
-				std::cout << "recv udp packet okay. " << std::endl;
-				udpRecvIdx = 0;
-				recvOkay = true;
+				if (ETRYAGAIN(errno))//超时，或者被信号中断
+				{
+					continue;
+				}
+				else
+				{
+					std::cout << "recv udp packet err ! " << std::endl;
+				}
+			}
+			else
+			{
+				std::cout << "recv udp message: " << nr << " bytes. " << "from fd: " << clientfd
+					<< ", and IpPort => " << inet_ntoa(peerAddr.sin_addr) << ":" << ntohs(peerAddr.sin_port) << std::endl;
+
+				udpRecvIdx += nr;
+				if (udpRecvIdx >= kProtoPacketMaxLen)//需要一个完整包
+				{
+					std::cout << "recv udp packet okay. " << std::endl;
+					udpRecvIdx = 0;
+					recvOkay = true;
+				}
 			}
 		}
 		else
 		{
 			int nRecv = recv(clientfd, (message.fragment + tcpRecvIdx), ((sizeof message.fragment) - tcpRecvIdx), 0);
-			tcpRecvIdx += nRecv;
 			std::cout << "recv tcp message: " << nRecv << " bytes. " << "from fd: " << clientfd << std::endl;
 			if (nRecv < 0)
 			{
@@ -729,6 +743,7 @@ void* worker_thread_func(void* arg)
 			}
 			else
 			{
+				tcpRecvIdx += nRecv;
 				if (tcpRecvIdx >= kProtoPacketMaxLen)
 				{
 					std::cout << "recv tcp packet okay. " << std::endl;
@@ -1066,8 +1081,9 @@ int main(int argc, char* argv[])
 									printf("start_time: %lld \r\n", it->second.flag.sTime);
 									printf("pid: %d \r\n", it->second.flag.pid);
 									it->second.connectState = TIMEOUT;
-									//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
-									//pox_system(shellCmd);
+									memset(shellCmd, 0x00, sizeof(shellCmd));
+									sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+									pox_system(shellCmd);
 									//杀死对方进程后，udp-client需要手动注销
 									g_udpConnections.erase(it++);//先删除当前，然后令当前迭代器指向其后继。
 
@@ -1095,8 +1111,8 @@ int main(int argc, char* argv[])
 									printf("start_time: %lld \r\n", it->second.flag.sTime);
 									printf("pid: %d \r\n", it->second.flag.pid);
 									it->second.connectState = TIMEOUT;
-									//sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
-									//pox_system(shellCmd);
+									sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+									pox_system(shellCmd);
 									//杀死对方进程后，
 									//操作系统会关闭意外退出进程中使用的tcp-socket，并会往本进程发送FIN分节，此时服务端即可注销客户端描述符
 
