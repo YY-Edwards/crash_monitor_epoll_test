@@ -108,7 +108,7 @@ typedef union{
 
 typedef struct{
 
-	CLIENTSTATE		connectState;//目标连接状态
+	CLIENTSTATE		lastState;//目标连接状态
 	int64_t			lastRecvTimestamp;
 	HeaderFlag_t	flag;
 
@@ -551,7 +551,7 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 	/*ClientInfo_t clientInfo;
 	int64_t now = getNowTimestamp();
 	clientInfo.lastRecvTimestamp = now;
-	clientInfo.connectState = CONNECTING;
+	clientInfo.lastState = CONNECTING;
 	clientInfo.flag.pid = 0;
 
 	pthread_mutex_lock(&g_mapMutex);
@@ -632,7 +632,7 @@ void* accept_thread_func(void* arg)
 		ClientInfo_t clientInfo;
 		int64_t now = getNowTimestamp();
 		clientInfo.lastRecvTimestamp = now;
-		clientInfo.connectState = CONNECTING;
+		clientInfo.lastState = CONNECTING;
 		clientInfo.flag.pid = 0;
 
 		pthread_mutex_lock(&g_mapMutex);
@@ -710,7 +710,6 @@ void* worker_thread_func(void* arg)
 		else
 		{
 			int nRecv = recv(clientfd, (message.fragment + tcpRecvIdx), ((sizeof message.fragment) - tcpRecvIdx), 0);
-			std::cout << "recv tcp message: " << nRecv << " bytes. " << "from fd: " << clientfd << std::endl;
 			if (nRecv < 0)
 			{
 				if (ETRYAGAIN(errno))//超时，或者被信号中断
@@ -743,6 +742,7 @@ void* worker_thread_func(void* arg)
 			}
 			else
 			{
+				std::cout << "recv tcp message: " << nRecv << " bytes. " << "from fd: " << clientfd << std::endl;
 				tcpRecvIdx += nRecv;
 				if (tcpRecvIdx >= kProtoPacketMaxLen)
 				{
@@ -777,7 +777,7 @@ void* worker_thread_func(void* arg)
 				if (clientfd == g_udpFd)//UDP客户端
 				{		
 					//直接下标操作，不存在则直接新插入
-					g_udpConnections[identityKey].connectState = WAITHEARTBEAT;
+					g_udpConnections[identityKey].lastState = WAITHEARTBEAT;
 					g_udpConnections[identityKey].lastRecvTimestamp = now;
 					memcpy(&g_udpConnections[identityKey].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
 				}
@@ -785,7 +785,7 @@ void* worker_thread_func(void* arg)
 				{
 					if (g_tcpConnections.find(clientfd) != g_tcpConnections.end())
 					{
-						g_tcpConnections[clientfd].connectState = WAITHEARTBEAT;
+						g_tcpConnections[clientfd].lastState = WAITHEARTBEAT;
 						g_tcpConnections[clientfd].lastRecvTimestamp = now;
 						memcpy(&g_tcpConnections[clientfd].flag, &(message.packet.header.flag), sizeof(HeaderFlag_t));
 					}
@@ -1053,6 +1053,7 @@ int main(int argc, char* argv[])
 				//通知接收连接线程接收新连接
 				if (ev[i].data.fd == g_listenfd)
 				{
+					std::cout << "epoll_wait: g_listenfd. " << std::endl;
 					g_accept_run_flag = true;
 					pthread_cond_signal(&g_acceptCond);
 				}
@@ -1069,7 +1070,7 @@ int main(int argc, char* argv[])
 						//polling udp client
 						for (std::map<std::string, ClientInfo_t>::iterator it = g_udpConnections.begin(); it != g_udpConnections.end();)
 						{
-							if (it->second.connectState == WAITHEARTBEAT)
+							if (it->second.lastState == WAITHEARTBEAT)
 							{
 								if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
 								{
@@ -1080,7 +1081,7 @@ int main(int argc, char* argv[])
 									printf("port: %d \r\n", it->second.flag.port);
 									printf("start_time: %lld \r\n", it->second.flag.sTime);
 									printf("pid: %d \r\n", it->second.flag.pid);
-									it->second.connectState = TIMEOUT;
+									it->second.lastState = TIMEOUT;
 									memset(shellCmd, 0x00, sizeof(shellCmd));
 									sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
 									pox_system(shellCmd);
@@ -1097,31 +1098,41 @@ int main(int argc, char* argv[])
 						}
 
 						//polling tcp client
-						for (std::map<int, ClientInfo_t>::iterator it = g_tcpConnections.begin(); it != g_tcpConnections.end(); it++)
+						for (std::map<int, ClientInfo_t>::iterator it = g_tcpConnections.begin(); it != g_tcpConnections.end();)
 						{
-							if (it->second.connectState == WAITHEARTBEAT)
-							{
+							//if (it->second.lastState == WAITHEARTBEAT)
+							//{
 								if ((it->second.lastRecvTimestamp) < (now - kMaxTimeout*kMicroSecondsPerSecond))
 								{
-									printf("fd=>%d heart timeout ! \r\n", it->first);
-									printf("client info: \r\n");
-									printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
-										it->second.flag.ip[2], it->second.flag.ip[3]);
-									printf("port: %d \r\n", it->second.flag.port);
-									printf("start_time: %lld \r\n", it->second.flag.sTime);
-									printf("pid: %d \r\n", it->second.flag.pid);
-									it->second.connectState = TIMEOUT;
-									sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
-									pox_system(shellCmd);
-									//杀死对方进程后，
-									//操作系统会关闭意外退出进程中使用的tcp-socket，并会往本进程发送FIN分节，此时服务端即可注销客户端描述符
-
+									if (it->second.lastState == WAITHEARTBEAT)
+									{
+										printf("fd=>%d heart timeout ! \r\n", it->first);
+										printf("client info: \r\n");
+										printf("ip: %d.%d.%d.%d \r\n", it->second.flag.ip[0], it->second.flag.ip[1],
+											it->second.flag.ip[2], it->second.flag.ip[3]);
+										printf("port: %d \r\n", it->second.flag.port);
+										printf("start_time: %lld \r\n", it->second.flag.sTime);
+										printf("pid: %d \r\n", it->second.flag.pid);
+										it->second.lastState = TIMEOUT;
+										sprintf(shellCmd, "kill -s 9 %d", it->second.flag.pid);
+										pox_system(shellCmd);
+										//杀死对方进程后，
+										//操作系统会关闭意外退出进程中使用的tcp-socket，并会往本进程发送FIN分节，此时服务端即可注销客户端描述符									
+										++it;
+									}
+									else//TIMEOUT or CONNECTING
+									{
+										printf("fd=>%d malicious connection! \r\n", it->first);
+										release_client(it->first);//删除客户端描述符
+										g_tcpConnections.erase(it++);//先把当前值传到erase里，自增，然后执行erase.
+									}
 								}
 								else
 								{
 									printf("\r\ntcp-fd=>%d heart oaky. \r\n", it->first);
+									++it;
 								}
-							}
+							//}
 
 						}
 					}
