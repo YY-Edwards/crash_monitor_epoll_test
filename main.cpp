@@ -19,6 +19,7 @@
 #include <linux/if.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <sys/signalfd.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <signal.h>     //for signal()
@@ -124,6 +125,40 @@ namespace daemonHeart
 	namespace detail
 	{
 
+		int createSignalfd()
+		{
+			sigset_t mask;
+			sigemptyset(&mask);    
+			sigaddset(&mask, SIGINT);    
+			sigaddset(&mask, SIGKILL);     
+			sigaddset(&mask, SIGTERM);
+			/* 阻塞信号以使得它们不被默认的处理试方式处理 */
+			if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1)
+			{
+				printf("Failed in signalfd");
+				return -1;
+			}
+			int newSigfd = signalfd(-1, &mask, TFD_NONBLOCK | TFD_CLOEXEC);
+			return newSigfd;
+		}
+
+		int readSignalfd(int signalfd)
+		{
+			struct signalfd_siginfo fdsi;
+			ssize_t n = read(signalfd, &fdsi, sizeof(struct signalfd_siginfo));
+			if (n != sizeof(struct signalfd_siginfo))
+			{
+				return -1;
+			}
+			else
+			{
+				return fdsi.ssi_signo;
+			}
+		}
+
+
+
+
 		int createEventfd()
 		{
 			int evtfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -221,6 +256,7 @@ bool g_accept_run_flag = false;//accept触发标志
 int g_listenfd = -1;//监听描述符
 int g_udpFd = -1;//UDP描述符
 int g_timerFd = -1;//定时描述符
+int g_signalFd = -1;//信号描述符
 
 
 pthread_t g_acceptthreadid = 0;
@@ -323,10 +359,10 @@ void set_timer(int seconds, int useconds)
 
 void prog_exit(int signo)
 {
-	signal(SIGINT, SIG_IGN);
+	/*signal(SIGINT, SIG_IGN);
 	signal(SIGKILL, SIG_IGN);
 	signal(SIGTERM, SIG_IGN);
-
+*/
 	std::cout << "program recv signal " << signo << " to exit." << std::endl;
 
 	//停止定时器
@@ -535,13 +571,13 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 
 	struct epoll_event e;
 	memset(&e, 0, sizeof(e));
-	e.events = EPOLLIN | EPOLLRDHUP;//注册事件：可读/关闭，挂断
+	e.events = EPOLLIN | EPOLLPRI;//注册事件：可读,带外紧急
 	e.data.fd = g_listenfd;
 	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_listenfd, &e) == -1)//注册新的监听fd到g_epollfd。
 		return false;
 
 	memset(&e, 0, sizeof(e));
-	e.events = EPOLLIN | EPOLLPRI;//注册事件：可读/外带
+	e.events = EPOLLIN;//注册事件：可读
 	e.data.fd = g_udpFd;
 	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_udpFd, &e) == -1)//注册新的UDP-fd到g_epollfd。
 		return false;
@@ -562,13 +598,17 @@ bool create_server_listener(const char* tcpIp, uint16_t tcpPort, const char* udp
 
 
 	memset(&e, 0, sizeof(e));
-	e.events = EPOLLIN | EPOLLPRI;//注册事件：可读/外带
+	e.events = EPOLLIN;//注册事件：可读
 	e.data.fd = g_timerFd;
 	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_timerFd, &e) == -1)//注册新的timer-fd到g_epollfd。
 		return false;
 
 
-
+	memset(&e, 0, sizeof(e));
+	e.events = EPOLLIN;//注册事件：可读
+	e.data.fd = g_signalFd;
+	if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_signalFd, &e) == -1)//注册新的signal-fd到g_epollfd。
+		return false;
 
 
 	return true;
@@ -686,6 +726,7 @@ void* worker_thread_func(void* arg)
 			{
 				if (ETRYAGAIN(errno))//超时，或者被信号中断
 				{
+					//std::cout << "ETRYAGAIN: " << errno  << std::endl;
 					continue;
 				}
 				else
@@ -995,9 +1036,12 @@ int main(int argc, char* argv[])
 	//设置信号处理
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_IGN);
-	signal(SIGINT, prog_exit);
-	signal(SIGKILL, prog_exit);
-	signal(SIGTERM, prog_exit);
+
+	g_signalFd = daemonHeart::detail::createSignalfd();
+	//signal(SIGINT, prog_exit);
+	//signal(SIGKILL, prog_exit);
+	//signal(SIGTERM, prog_exit);
+
 
 	pthread_cond_init(&g_acceptCond, NULL);
 	pthread_mutex_init(&g_acceptMutex, NULL);
@@ -1036,7 +1080,7 @@ int main(int argc, char* argv[])
 	while (!g_bStop)
 	{
 		struct epoll_event ev[10];
-		int n = epoll_wait(g_epollfd, ev, 10, 10);//10ms
+		int n = epoll_wait(g_epollfd, ev, 10, 100);//100ms
 		if (n == 0)//超时
 			continue;
 		else if (n < 0)
@@ -1050,14 +1094,18 @@ int main(int argc, char* argv[])
 			//int m = min(n, 1024);//最大只能取到1024
 			for (int i = 0; i < n; ++i)
 			{
+				int activeFd = ev[i].data.fd;
+				int revents = ev[i].events;
 				//通知接收连接线程接收新连接
-				if (ev[i].data.fd == g_listenfd)
+				if ((activeFd == g_listenfd) && 
+					(revents &(EPOLLIN | EPOLLPRI)))
 				{
 					std::cout << "epoll_wait: g_listenfd. " << std::endl;
 					g_accept_run_flag = true;
 					pthread_cond_signal(&g_acceptCond);
 				}
-				else if (ev[i].data.fd == g_timerFd)//定时任务事件
+				else if ((activeFd == g_timerFd)&&
+					(revents & EPOLLIN))//定时任务事件
 				{
 					std::cout << "epoll_wait: g_timerFd. " << std::endl;
 					//读取事件，如果不读取由于Epoll水平触发会导致一直有IO事件产生
@@ -1143,7 +1191,17 @@ int main(int argc, char* argv[])
 				//{
 				//}
 				//通知普通工作线程接收数据
-				else//客户端可读事件(tcp/udp)
+				else if ((activeFd == g_signalFd) &&
+					(revents & EPOLLIN))//信号任务事件
+				{
+					int signo = -1;
+					signo = daemonHeart::detail::readSignalfd(activeFd);
+					if (signo > 0)
+					{
+						prog_exit(signo);
+					}
+				}
+				else if ((revents & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)))//客户端可读事件(tcp/udp)
 				{
 					pthread_mutex_lock(&g_listMutex);
 					g_activeClients.push_back(ev[i].data.fd);
@@ -1151,7 +1209,10 @@ int main(int argc, char* argv[])
 					pthread_cond_signal(&g_cond);
 					//std::cout << "signal" << std::endl;
 				}
-
+				else
+				{
+					std::cout << "epoll_wait return unkown event: " << revents << std::endl;
+				}
 			}
 		}
 
